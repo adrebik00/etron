@@ -1,0 +1,10 @@
+__pycache__/
+_cache/
+*.pkl
+*.pyc
+bt_output/
+monitor_output/
+monitor_report.html
+.env
+*.csv
+scan_daily.py
