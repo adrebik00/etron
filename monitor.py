@@ -38,7 +38,7 @@ import strategy as ST
 # ── 모니터 전용: 스캔 범위를 넓히기 위해 백테스트보다 느슨한 조건 ──
 # --strict 플래그로 백테스트 동일 조건 복원 가능
 _ORIG_RECOVER_WINDOW = ST.RECOVER_WINDOW
-ST.RECOVER_WINDOW     = 2
+ST.RECOVER_WINDOW     = 5
 ST.USE_ROOM_FILTER    = False
 ST.USE_ATR_FILTER     = False
 ST.USE_DRYUP_FILTER   = False
@@ -583,6 +583,7 @@ def build_html(results, watchlist_content):
         f'<a href="#crypto">코인 ({cr_s}+{cr_w})</a>',
         f'<a class="dl" href="#" id="dl-btn">'
         f'워치리스트 ({total_sig + total_watch})</a>',
+        '<a href="archive.html">아카이브</a>',
         '</nav></header>',
 
         '<div class="rule" style="margin:16px 20px">',
@@ -792,6 +793,35 @@ def load_all_results():
     return results
 
 
+def build_archive_html():
+    """public/ 내 날짜별 HTML 파일 목록을 아카이브 페이지로 생성."""
+    import re
+    date_re = re.compile(r'^(\d{4}-\d{2}-\d{2})\.html$')
+    entries = []
+    for fn in os.listdir(OUTPUT_DIR):
+        m = date_re.match(fn)
+        if m:
+            entries.append(m.group(1))
+    entries.sort(reverse=True)
+
+    rows = '\n'.join(
+        f'<tr><td><a href="{d}.html">{d}</a></td></tr>' for d in entries
+    ) if entries else '<tr><td>아직 기록이 없습니다.</td></tr>'
+
+    return (
+        '<!DOCTYPE html>\n<html lang="ko"><head><meta charset="UTF-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<title>CCI 반등 모니터 — 아카이브</title>'
+        f'<style>{CSS}</style></head><body>'
+        '<header><h1>CCI 반등 모니터 — 아카이브</h1>'
+        '<nav><a href="index.html">최신</a></nav></header>'
+        '<div style="margin:20px"><table class="tbl">'
+        '<thead><tr><th>날짜</th></tr></thead>'
+        f'<tbody>{rows}</tbody></table></div>'
+        '</body></html>'
+    )
+
+
 def rebuild_html(results=None):
     if results is None:
         results = load_all_results()
@@ -800,11 +830,24 @@ def rebuild_html(results=None):
     watchlist = generate_watchlist(results)
     html = build_html(results, watchlist)
 
+    today = datetime.now().strftime('%Y-%m-%d')
+    dated_path = os.path.join(OUTPUT_DIR, f'{today}.html')
+    with open(dated_path, 'w', encoding='utf-8') as f:
+        f.write(html)
+
     index_path = os.path.join(OUTPUT_DIR, 'index.html')
     with open(index_path, 'w', encoding='utf-8') as f:
         f.write(html)
     size_mb = os.path.getsize(index_path) / 1024 / 1024
-    print(f"  HTML 저장: {index_path} ({size_mb:.1f} MB)")
+    print(f"  HTML 저장: {dated_path} ({size_mb:.1f} MB)")
+
+    archive_html = build_archive_html()
+    archive_path = os.path.join(OUTPUT_DIR, 'archive.html')
+    with open(archive_path, 'w', encoding='utf-8') as f:
+        f.write(archive_html)
+    n_dates = len([e for e in os.listdir(OUTPUT_DIR)
+                   if e[:4].isdigit() and e.endswith('.html')])
+    print(f"  아카이브: {archive_path} ({n_dates}일)")
 
     wl_path = os.path.join(OUTPUT_DIR, 'watchlist.txt')
     with open(wl_path, 'w', encoding='utf-8') as f:
