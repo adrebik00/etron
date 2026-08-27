@@ -1,17 +1,17 @@
 """
 CCI 반등 + 200일선 하단 + 피보나치 되돌림 — 모니터링 + Vercel 배포
 ============================================================
-시장별(KR/US/Crypto) 장종료 이후 자동 스캔 -> HTML 리포트 -> Git push -> Vercel 배포
+로컬 KR/US 일봉 CSV 장종료 갱신 후 자동 스캔 -> HTML 리포트 -> Git push -> Vercel 배포
 
 [사용법]
-  python monitor.py                        # 전 시장 원샷 스캔
+  python monitor.py                        # KR/US 로컬 CSV 원샷 스캔
   python monitor.py --market kr            # 한국만
   python monitor.py --market us            # 미국만
-  python monitor.py --market crypto        # 코인만
   python monitor.py --daemon               # 24시간 스케줄러
+  python monitor.py --after-update kr      # update_charts.py가 호출하는 내부 옵션
   python monitor.py --no-git               # Git push 안 함
   python monitor.py --strict               # 백테스트 동일 조건(추가 필터 전부 켜기)
-  python monitor.py --use-cache --no-git   # 캐시로 빠르게 재생성
+  python monitor.py --no-git               # Git push 없이 결과 생성
 
 [산출물]
   public/index.html       <- Vercel 에서 서빙하는 메인 페이지
@@ -21,7 +21,7 @@ CCI 반등 + 200일선 하단 + 피보나치 되돌림 — 모니터링 + Vercel
 import os
 import sys
 import time
-import pickle
+import json
 import argparse
 import subprocess
 from datetime import datetime, timedelta
@@ -38,7 +38,7 @@ import strategy as ST
 # ── 모니터 전용: 스캔 범위를 넓히기 위해 백테스트보다 느슨한 조건 ──
 # --strict 플래그로 백테스트 동일 조건 복원 가능
 _ORIG_RECOVER_WINDOW = ST.RECOVER_WINDOW
-ST.RECOVER_WINDOW     = 5
+ST.RECOVER_WINDOW     = 2
 ST.USE_ROOM_FILTER    = False
 ST.USE_ATR_FILTER     = False
 ST.USE_DRYUP_FILTER   = False
@@ -48,155 +48,54 @@ ST.USE_RSI_DIV_FILTER = False
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(BASE_DIR, 'public')
-CACHE_DIR  = os.path.join(BASE_DIR, '_cache')
-
-FETCH_PERIOD = '10y'
-YF_BATCH     = 60
+STATE_DIR  = os.path.join(BASE_DIR, 'monitor_state')
+BACKTEST_DIR = Path(os.environ.get(
+    'CCI_BACKTEST_DIR', r'C:\Users\user\Documents\claude_coding\backtest'))
+DAILY_DIRS = {
+    'kr': BACKTEST_DIR / 'kr_stock' / 'daily',
+    'us': BACKTEST_DIR / 'us_stock' / 'daily',
+}
 VIEW_BARS    = 200
 MAX_CHARTS_SIGNAL = 30
 MAX_CHARTS_WATCH  = 10
 
 UP_C, DN_C = '#26a69a', '#ef5350'
 
-CRYPTO_TICKERS = {
-    'BTC-USD':  {'name': 'Bitcoin',   'market': 'CRYPTO', 'yf': 'BTC-USD',  'tv': 'BINANCE:BTCUSDT'},
-    'ETH-USD':  {'name': 'Ethereum',  'market': 'CRYPTO', 'yf': 'ETH-USD',  'tv': 'BINANCE:ETHUSDT'},
-    'XRP-USD':  {'name': 'XRP',       'market': 'CRYPTO', 'yf': 'XRP-USD',  'tv': 'BINANCE:XRPUSDT'},
-    'SOL-USD':  {'name': 'Solana',    'market': 'CRYPTO', 'yf': 'SOL-USD',  'tv': 'BINANCE:SOLUSDT'},
-    'BNB-USD':  {'name': 'BNB',       'market': 'CRYPTO', 'yf': 'BNB-USD',  'tv': 'BINANCE:BNBUSDT'},
-    'DOGE-USD': {'name': 'Dogecoin',  'market': 'CRYPTO', 'yf': 'DOGE-USD', 'tv': 'BINANCE:DOGEUSDT'},
-    'ADA-USD':  {'name': 'Cardano',   'market': 'CRYPTO', 'yf': 'ADA-USD',  'tv': 'BINANCE:ADAUSDT'},
-    'TRX-USD':  {'name': 'TRON',      'market': 'CRYPTO', 'yf': 'TRX-USD',  'tv': 'BINANCE:TRXUSDT'},
-    'AVAX-USD': {'name': 'Avalanche', 'market': 'CRYPTO', 'yf': 'AVAX-USD', 'tv': 'BINANCE:AVAXUSDT'},
-    'LINK-USD': {'name': 'Chainlink', 'market': 'CRYPTO', 'yf': 'LINK-USD', 'tv': 'BINANCE:LINKUSDT'},
-}
-
 EXCH_MAP = {
     'NASDAQ': 'NASDAQ', 'NYSE': 'NYSE', 'S&P500': 'NASDAQ',
-    'KOSPI': 'KRX', 'KOSDAQ': 'KRX', 'CRYPTO': 'BINANCE',
+    'KOSPI': 'KRX', 'KOSDAQ': 'KRX', 'KRX': 'KRX',
 }
 
 # 스케줄 (KST 기준)
 KR_SCAN_TIME     = (15, 40)
 US_SCAN_TIME     = (6, 10)
-CRYPTO_SCAN_TIME = (9, 0)
 US_SCAN_DAYS     = {1, 2, 3, 4, 5}
 
 ENABLE_GIT_PUSH = True
 
 
 # ============================================================
-# 종목 리스트
+# 로컬 CSV 종목 목록
 # ============================================================
-def get_us_tickers(limit=2000):
-    import FinanceDataReader as fdr
-    tickers = {}
-    for src in ['S&P500', 'NASDAQ', 'NYSE']:
-        try:
-            df = fdr.StockListing(src)
-            sc = 'Symbol' if 'Symbol' in df.columns else df.columns[0]
-            nc = 'Name' if 'Name' in df.columns else (
-                'Security' if 'Security' in df.columns else sc)
-            for mc_col in ('Marcap', 'MarCap', 'MarketCap'):
-                if mc_col in df.columns:
-                    df = df.sort_values(mc_col, ascending=False)
-                    break
-            for _, row in df.iterrows():
-                sym = str(row[sc]).replace('.', '-')
-                if sym not in tickers:
-                    tickers[sym] = {
-                        'name': str(row.get(nc, sym)),
-                        'market': src if src != 'S&P500' else 'NASDAQ',
-                        'yf': sym}
-                if len(tickers) >= limit:
-                    break
-        except Exception as e:
-            print(f"  [WARN] {src} 목록 실패: {e}")
-        if len(tickers) >= limit:
-            break
-    tickers = dict(list(tickers.items())[:limit])
-    print(f"  미국 {len(tickers)}개")
-    return tickers
-
-
-def get_kr_tickers(limit=1000):
-    import FinanceDataReader as fdr
-    try:
-        d = fdr.StockListing('KRX')
-        mask = (d['Market'].isin(['KOSPI', 'KOSDAQ'])
-                & ~d['Name'].str.contains(
-                    r'ETN|스팩|제\d+호|우선주|\d+우', regex=True, na=False))
-        d = d[mask]
-        for col in ('Marcap', 'MarCap'):
-            if col in d.columns:
-                d = d.sort_values(col, ascending=False)
-                break
-        tickers = {}
-        for _, row in d.head(limit).iterrows():
-            code = str(row['Code']).zfill(6)
-            tickers[code] = {
-                'name': row['Name'], 'market': row['Market'],
-                'yf': f"{code}{'.KS' if row['Market'] == 'KOSPI' else '.KQ'}"}
-        print(f"  한국 {len(tickers)}개")
-        return tickers
-    except Exception as e:
-        print(f"  [WARN] 한국 목록 실패: {e}")
-        return {}
-
-
-def get_crypto_tickers():
-    print(f"  코인 {len(CRYPTO_TICKERS)}개")
-    return dict(CRYPTO_TICKERS)
-
-
-# ============================================================
-# 데이터 수신
-# ============================================================
-def fetch_yahoo(tickers, period=FETCH_PERIOD, batch=YF_BATCH,
-                pause=0.5, retries=2):
-    import yfinance as yf
-    keys = list(tickers.keys())
-    ymap = {tickers[k]['yf']: k for k in keys}
-    syms = [tickers[k]['yf'] for k in keys]
-    out = {}
-    t0 = time.time()
-    for i in range(0, len(syms), batch):
-        chunk = syms[i:i + batch]
-        data = None
-        for attempt in range(retries + 1):
-            try:
-                data = yf.download(chunk, period=period, progress=False,
-                                   auto_adjust=True, threads=True,
-                                   group_by='column')
-                if data is not None and not data.empty:
-                    break
-            except Exception as e:
-                if attempt == retries:
-                    print(f"  [WARN] 배치 {i}~ 실패: {e}", flush=True)
-                    data = None
-            if attempt < retries:
-                time.sleep(3.0 * (attempt + 1))
-        time.sleep(pause)
-        if data is None or data.empty:
-            continue
-        for sym in chunk:
-            try:
-                if isinstance(data.columns, pd.MultiIndex):
-                    sub = data.xs(sym, level=1, axis=1).copy()
-                else:
-                    sub = data.copy()
-                sub = sub.reset_index()
-                df = ST.normalize_ohlcv(sub)
-                if df is None or len(df) < ST.MIN_BARS:
-                    continue
-                df, _, _ = ST.clean_ohlcv(df)
-                if len(df) >= ST.MIN_BARS:
-                    out[ymap[sym]] = df
-            except Exception:
+def local_instruments(market, limit=0):
+    """백테스트와 동일한 일봉 CSV만 사용한다. 네트워크 수신은 하지 않는다."""
+    folder = DAILY_DIRS[market]
+    if not folder.is_dir():
+        raise FileNotFoundError(f'일봉 폴더 없음: {folder}')
+    instruments = []
+    for path in sorted(folder.glob('*.csv')):
+        stem = path.stem
+        if market == 'kr':
+            name, sep, code = stem.rpartition('_')
+            if not sep or not code.isdigit() or len(code) != 6:
                 continue
-        print(f"  {min(i + batch, len(syms))}/{len(syms)} 수신 "
-              f"{len(out)}개 ({time.time() - t0:.0f}s)", flush=True)
-    return out
+            instruments.append((code, {'name': name, 'market': 'KRX'}, path))
+        else:
+            instruments.append((stem, {'name': stem, 'market': 'NASDAQ'}, path))
+    if limit:
+        instruments = instruments[:limit]
+    print(f'  로컬 {market.upper()} 일봉 CSV {len(instruments)}개: {folder}')
+    return instruments
 
 
 # ============================================================
@@ -263,11 +162,6 @@ def evaluate(sym, info, df):
 # TradingView 심볼 변환
 # ============================================================
 def tv_symbol(sym, market):
-    if market == 'CRYPTO':
-        info = CRYPTO_TICKERS.get(sym)
-        if info and 'tv' in info:
-            return info['tv']
-        return f'BINANCE:{sym.replace("-USD", "USDT")}'
     ex = EXCH_MAP.get(market, 'NASDAQ')
     clean = sym.split('.')[0]
     return f'{ex}:{clean}'
@@ -355,8 +249,7 @@ def build_chart(rec, div_id):
         range=[min(cmin, -250) - 20, max(cmax, 120) + 20], row=2, col=1)
 
     fig.update_xaxes(rangeslider_visible=False)
-    if rec['market'] not in ('CRYPTO',):
-        fig.update_xaxes(rangebreaks=[dict(bounds=['sat', 'mon'])])
+    fig.update_xaxes(rangebreaks=[dict(bounds=['sat', 'mon'])])
     fig.update_layout(
         height=440, margin=dict(l=8, r=8, t=26, b=8),
         paper_bgcolor='#161b22', plot_bgcolor='#161b22',
@@ -563,7 +456,6 @@ def build_html(results, watchlist_content):
         return (len(r['signals']), len(r['watch'])) if r else (0, 0)
     kr_s, kr_w = mc('kr')
     us_s, us_w = mc('us')
-    cr_s, cr_w = mc('crypto')
 
     wl_escaped = _esc(watchlist_content)
 
@@ -580,7 +472,6 @@ def build_html(results, watchlist_content):
         '<nav>',
         f'<a href="#kr">한국 ({kr_s}+{kr_w})</a>',
         f'<a href="#us">미국 ({us_s}+{us_w})</a>',
-        f'<a href="#crypto">코인 ({cr_s}+{cr_w})</a>',
         f'<a class="dl" href="#" id="dl-btn">'
         f'워치리스트 ({total_sig + total_watch})</a>',
         '<a href="archive.html">아카이브</a>',
@@ -603,9 +494,6 @@ def build_html(results, watchlist_content):
         'kr', '한국 — 시총 상위 1,000개', results.get('kr')))
     parts.append(market_section_html(
         'us', '미국 — 시총 상위 2,000개', results.get('us')))
-    parts.append(market_section_html(
-        'crypto', '암호화폐 — 시총 상위 10개', results.get('crypto')))
-
     parts.append(
         f'<div id="wl-data" style="display:none">{wl_escaped}</div>')
     parts.append(
@@ -639,7 +527,7 @@ def build_html(results, watchlist_content):
 # ============================================================
 def generate_watchlist(results):
     lines = []
-    for mkt in ('kr', 'us', 'crypto'):
+    for mkt in ('kr', 'us'):
         res = results.get(mkt)
         if res is None:
             continue
@@ -685,66 +573,33 @@ def git_push(msg):
 # ============================================================
 # 시장 스캔
 # ============================================================
-def scan_market(market, use_cache=False, save_cache=False,
-                pause=0.5, limit=0):
+def _state_path(market):
+    return os.path.join(STATE_DIR, f'{market}_result.json')
+
+
+def scan_market(market, limit=0):
     t0 = time.time()
     print(f"\n{'=' * 60}")
     print(f" {market.upper()} 스캔 시작 "
           f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'=' * 60}")
 
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    cache_file = os.path.join(CACHE_DIR, f'{market}_data.pkl')
-
-    if use_cache and os.path.exists(cache_file):
-        with open(cache_file, 'rb') as f:
-            tickers, data = pickle.load(f)
-        print(f"  캐시 사용: {len(data)}종목")
-    else:
-        if market == 'kr':
-            tickers = get_kr_tickers(1000)
-        elif market == 'us':
-            tickers = get_us_tickers(2000)
-        elif market == 'crypto':
-            tickers = get_crypto_tickers()
-        else:
-            raise ValueError(f"Unknown market: {market}")
-
-        if limit:
-            tickers = dict(list(tickers.items())[:limit])
-        if not tickers:
-            print(f"  [ERROR] 종목 목록이 비었습니다.")
-            return None
-
-        print(f"데이터 수신 ({FETCH_PERIOD}, {len(tickers)}종목) ...")
-        data = fetch_yahoo(tickers, period=FETCH_PERIOD, pause=pause)
-        miss = len(tickers) - len(data)
-        if miss:
-            print(f"  [주의] {miss}종목 수신 실패")
-
-        if save_cache and data:
-            slim = {}
-            for k, v in data.items():
-                w = v.copy()
-                for col in ('Open', 'High', 'Low', 'Close', 'Volume'):
-                    w[col] = w[col].astype('float32')
-                slim[k] = w
-            with open(cache_file, 'wb') as f:
-                pickle.dump((tickers, slim), f,
-                            protocol=pickle.HIGHEST_PROTOCOL)
-            print(f"  캐시 저장: "
-                  f"{os.path.getsize(cache_file) / 1024 / 1024:.0f} MB")
-
-    if not data:
-        print(f"  [ERROR] 수신 데이터 없음")
+    instruments = local_instruments(market, limit)
+    if not instruments:
+        print('  [ERROR] 스캔할 CSV가 없습니다.')
         return None
 
-    print(f"스캔 {len(data)}종목 ...")
+    print(f"로컬 CSV 스캔 {len(instruments)}종목 ...")
     sig, watch = [], []
     asof = ''
-    for sym, df in data.items():
+    loaded = 0
+    for n, (sym, info, path) in enumerate(instruments, 1):
         try:
-            r = evaluate(sym, tickers.get(sym, {'name': sym}), df)
+            df = ST.load_csv(path)
+            if df is None or len(df) < ST.MIN_BARS:
+                continue
+            loaded += 1
+            r = evaluate(sym, info, df)
         except Exception:
             continue
         last = pd.Timestamp(df['Date'].values[-1]).strftime('%Y-%m-%d')
@@ -756,6 +611,8 @@ def scan_market(market, use_cache=False, save_cache=False,
         del r['df']
         del r['idx']
         (sig if r['tier'] == 'signal' else watch).append(r)
+        if n % 250 == 0:
+            print(f'  {n}/{len(instruments)} 처리 · 후보 {len(sig) + len(watch)}개', flush=True)
 
     sig.sort(key=lambda r: -r['fib_pos'])
     watch.sort(key=lambda r: r['cci'])
@@ -763,15 +620,15 @@ def scan_market(market, use_cache=False, save_cache=False,
     result = {
         'market': market,
         'scan_time': datetime.now().strftime('%Y-%m-%d %H:%M'),
-        'scanned': len(data),
+        'scanned': loaded,
         'asof': asof,
         'signals': sig,
         'watch': watch,
     }
 
-    result_file = os.path.join(CACHE_DIR, f'{market}_result.pkl')
-    with open(result_file, 'wb') as f:
-        pickle.dump(result, f)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(_state_path(market), 'w', encoding='utf-8') as f:
+        json.dump(result, f, ensure_ascii=False)
 
     print(f"  진입 신호 {len(sig)}개 / 관찰 {len(watch)}개 "
           f"({time.time() - t0:.0f}s)")
@@ -780,12 +637,12 @@ def scan_market(market, use_cache=False, save_cache=False,
 
 def load_all_results():
     results = {}
-    for market in ('kr', 'us', 'crypto'):
-        path = os.path.join(CACHE_DIR, f'{market}_result.pkl')
+    for market in ('kr', 'us'):
+        path = _state_path(market)
         if os.path.exists(path):
             try:
-                with open(path, 'rb') as f:
-                    results[market] = pickle.load(f)
+                with open(path, encoding='utf-8') as f:
+                    results[market] = json.load(f)
             except Exception:
                 results[market] = None
         else:
@@ -900,6 +757,27 @@ def _secs_until(h, m, only_days=None):
     return (target - now).total_seconds()
 
 
+def update_chart_csv(market):
+    """장 마감 뒤 원본 CSV 갱신을 성공한 경우에만 스캔한다."""
+    script = BACKTEST_DIR / 'update_charts.py'
+    if not script.exists():
+        raise FileNotFoundError(f'업데이트 스크립트 없음: {script}')
+    print(f'  [{market.upper()}] update_charts.py 실행')
+    result = subprocess.run(
+        [sys.executable, str(script), '--market', market, '--skip-monitor'],
+        cwd=str(BACKTEST_DIR), text=True, timeout=1800)
+    if result.returncode != 0:
+        raise RuntimeError(f'CSV 업데이트 실패 (exit {result.returncode})')
+
+
+def update_then_scan(market, git_message):
+    update_chart_csv(market)
+    if scan_market(market) is None:
+        raise RuntimeError('스캔 결과가 없습니다.')
+    rebuild_html()
+    git_push(git_message)
+
+
 def daemon_loop():
     print(f"{'=' * 60}")
     print(f" CCI 반등 모니터 24시간 스케줄러")
@@ -909,10 +787,16 @@ def daemon_loop():
           f"{KR_SCAN_TIME[0]:02d}:{KR_SCAN_TIME[1]:02d} KST")
     print(f"  미국:  화~토      "
           f"{US_SCAN_TIME[0]:02d}:{US_SCAN_TIME[1]:02d} KST")
-    print(f"  코인:  매일       "
-          f"{CRYPTO_SCAN_TIME[0]:02d}:{CRYPTO_SCAN_TIME[1]:02d} KST")
     print(f"  Git push: {ENABLE_GIT_PUSH}")
     print(f"  Ctrl+C 로 종료\n")
+
+    print(f"  [시작] KR/US CSV 갱신 후 초기 스캔 실행")
+    for m in ('kr', 'us'):
+        try:
+            update_then_scan(m, f'[scan] 초기 {m.upper()} {datetime.now():%Y%m%d_%H%M}')
+            _mark_ran(m)
+        except Exception as e:
+            print(f"[ERROR] {m.upper()} 초기 스캔: {e}")
 
     SLEEP = 30
 
@@ -935,9 +819,7 @@ def daemon_loop():
                 and now.weekday() < 5 and not _already_ran('kr')):
             _mark_ran('kr')
             try:
-                scan_market('kr', save_cache=True)
-                rebuild_html()
-                git_push(f'[scan] KR {now.strftime("%Y%m%d")}')
+                update_then_scan('kr', f'[scan] KR {now.strftime("%Y%m%d")}')
                 scanned = True
             except Exception as e:
                 print(f"[ERROR] KR scan: {e}")
@@ -947,28 +829,15 @@ def daemon_loop():
               and not _already_ran('us')):
             _mark_ran('us')
             try:
-                scan_market('us', save_cache=True)
-                rebuild_html()
-                git_push(f'[scan] US {now.strftime("%Y%m%d")}')
+                update_then_scan('us', f'[scan] US {now.strftime("%Y%m%d")}')
                 scanned = True
             except Exception as e:
                 print(f"[ERROR] US scan: {e}")
 
-        elif ((h, m) == CRYPTO_SCAN_TIME and not _already_ran('crypto')):
-            _mark_ran('crypto')
-            try:
-                scan_market('crypto')
-                rebuild_html()
-                git_push(f'[scan] Crypto {now.strftime("%Y%m%d")}')
-                scanned = True
-            except Exception as e:
-                print(f"[ERROR] Crypto scan: {e}")
-
         if not scanned:
             ks = _secs_until(*KR_SCAN_TIME, only_days={0, 1, 2, 3, 4})
             us = _secs_until(*US_SCAN_TIME, only_days=US_SCAN_DAYS)
-            cs = _secs_until(*CRYPTO_SCAN_TIME)
-            labels = [(ks, 'KR'), (us, 'US'), (cs, 'Crypto')]
+            labels = [(ks, 'KR'), (us, 'US')]
             labels.sort(key=lambda x: x[0])
             nlbl = labels[0][1]
             ns = labels[0][0]
@@ -985,16 +854,12 @@ def daemon_loop():
 def main():
     ap = argparse.ArgumentParser(
         description='CCI 반등 모니터링 + Vercel 배포')
-    ap.add_argument('--market',
-                    choices=['kr', 'us', 'crypto', 'all'], default='all')
+    ap.add_argument('--market', choices=['kr', 'us', 'all'], default='all')
     ap.add_argument('--daemon', action='store_true',
                     help='24시간 스케줄러 모드')
-    ap.add_argument('--pause', type=float, default=0.5)
     ap.add_argument('--limit', type=int, default=0)
-    ap.add_argument('--cache', action='store_true',
-                    help='데이터 캐시 저장')
-    ap.add_argument('--use-cache', action='store_true',
-                    help='캐시 사용')
+    ap.add_argument('--after-update', choices=['kr', 'us'],
+                    help='update_charts.py 완료 뒤 해당 시장만 스캔')
     ap.add_argument('--no-git', action='store_true',
                     help='Git push 안 함')
     ap.add_argument('--open', action='store_true',
@@ -1020,11 +885,10 @@ def main():
         daemon_loop()
         return
 
-    markets = (['kr', 'us', 'crypto'] if args.market == 'all'
-               else [args.market])
+    markets = ([args.after_update] if args.after_update
+               else (['kr', 'us'] if args.market == 'all' else [args.market]))
     for m in markets:
-        scan_market(m, use_cache=args.use_cache, save_cache=args.cache,
-                    pause=args.pause, limit=args.limit)
+        scan_market(m, limit=args.limit)
 
     rebuild_html()
 
