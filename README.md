@@ -213,12 +213,11 @@ C:\Users\user\anaconda3\python.exe monitor.py --market all --open
 |---|---|
 | `--market us\|kr\|all` | 로컬 CSV 시장 선택 |
 | `--limit N` | 점검용으로 앞 N개 CSV만 스캔 |
-| `--daemon` | 시작 시 KR·US를 한 번 갱신·스캔한 뒤, 장 마감 시각에 반복 |
-| `--after-update kr\|us` | `update_charts.py`가 CSV 갱신 뒤 호출하는 내부 옵션 |
+| `--daemon` | 시작 시 KR·US를 한 번 스캔한 뒤, 장 마감 후 시각에 반복 |
 | `--open` | 생성 후 브라우저로 열기 |
 
-`update_charts.py`는 KR 또는 US 일봉 CSV 갱신이 성공하면 이 모니터를 자동 호출한다.
-`monitor.py --daemon`을 직접 실행해도 동일하게 **CSV 갱신 → 로컬 스캔 → HTML 생성 → Git push** 순서로 동작한다.
+`update_charts.py`는 별도 스케줄로 일봉 CSV를 갱신한다. `monitor.py --daemon`은 이를 호출하지 않고,
+설정된 장 마감 후 시각에 이미 갱신된 CSV를 읽어 **로컬 스캔 → HTML 생성 → Git push**만 수행한다.
 
 산출물은 `public/YYYY-MM-DD.html`, `public/index.html`, `public/archive.html`,
 `public/watchlist.txt`다. `index.html`은 가장 최근 결과이며 Vercel 홈페이지로 바로 서빙된다.

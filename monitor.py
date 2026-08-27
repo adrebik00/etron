@@ -8,7 +8,6 @@ CCI 반등 + 200일선 하단 + 피보나치 되돌림 — 모니터링 + Vercel
   python monitor.py --market kr            # 한국만
   python monitor.py --market us            # 미국만
   python monitor.py --daemon               # 24시간 스케줄러
-  python monitor.py --after-update kr      # update_charts.py가 호출하는 내부 옵션
   python monitor.py --no-git               # Git push 안 함
   python monitor.py --strict               # 백테스트 동일 조건(추가 필터 전부 켜기)
   python monitor.py --no-git               # Git push 없이 결과 생성
@@ -19,7 +18,6 @@ CCI 반등 + 200일선 하단 + 피보나치 되돌림 — 모니터링 + Vercel
 """
 
 import os
-import sys
 import time
 import json
 import argparse
@@ -757,21 +755,8 @@ def _secs_until(h, m, only_days=None):
     return (target - now).total_seconds()
 
 
-def update_chart_csv(market):
-    """장 마감 뒤 원본 CSV 갱신을 성공한 경우에만 스캔한다."""
-    script = BACKTEST_DIR / 'update_charts.py'
-    if not script.exists():
-        raise FileNotFoundError(f'업데이트 스크립트 없음: {script}')
-    print(f'  [{market.upper()}] update_charts.py 실행')
-    result = subprocess.run(
-        [sys.executable, str(script), '--market', market, '--skip-monitor'],
-        cwd=str(BACKTEST_DIR), text=True, timeout=1800)
-    if result.returncode != 0:
-        raise RuntimeError(f'CSV 업데이트 실패 (exit {result.returncode})')
-
-
-def update_then_scan(market, git_message):
-    update_chart_csv(market)
+def scan_then_publish(market, git_message):
+    """이미 갱신된 로컬 CSV를 읽어 리포트와 Vercel 결과를 갱신한다."""
     if scan_market(market) is None:
         raise RuntimeError('스캔 결과가 없습니다.')
     rebuild_html()
@@ -790,10 +775,10 @@ def daemon_loop():
     print(f"  Git push: {ENABLE_GIT_PUSH}")
     print(f"  Ctrl+C 로 종료\n")
 
-    print(f"  [시작] KR/US CSV 갱신 후 초기 스캔 실행")
+    print(f"  [시작] 현재 로컬 KR/US CSV로 초기 스캔 실행")
     for m in ('kr', 'us'):
         try:
-            update_then_scan(m, f'[scan] 초기 {m.upper()} {datetime.now():%Y%m%d_%H%M}')
+            scan_then_publish(m, f'[scan] 초기 {m.upper()} {datetime.now():%Y%m%d_%H%M}')
             _mark_ran(m)
         except Exception as e:
             print(f"[ERROR] {m.upper()} 초기 스캔: {e}")
@@ -819,7 +804,7 @@ def daemon_loop():
                 and now.weekday() < 5 and not _already_ran('kr')):
             _mark_ran('kr')
             try:
-                update_then_scan('kr', f'[scan] KR {now.strftime("%Y%m%d")}')
+                scan_then_publish('kr', f'[scan] KR {now.strftime("%Y%m%d")}')
                 scanned = True
             except Exception as e:
                 print(f"[ERROR] KR scan: {e}")
@@ -829,7 +814,7 @@ def daemon_loop():
               and not _already_ran('us')):
             _mark_ran('us')
             try:
-                update_then_scan('us', f'[scan] US {now.strftime("%Y%m%d")}')
+                scan_then_publish('us', f'[scan] US {now.strftime("%Y%m%d")}')
                 scanned = True
             except Exception as e:
                 print(f"[ERROR] US scan: {e}")
@@ -858,8 +843,6 @@ def main():
     ap.add_argument('--daemon', action='store_true',
                     help='24시간 스케줄러 모드')
     ap.add_argument('--limit', type=int, default=0)
-    ap.add_argument('--after-update', choices=['kr', 'us'],
-                    help='update_charts.py 완료 뒤 해당 시장만 스캔')
     ap.add_argument('--no-git', action='store_true',
                     help='Git push 안 함')
     ap.add_argument('--open', action='store_true',
@@ -885,8 +868,7 @@ def main():
         daemon_loop()
         return
 
-    markets = ([args.after_update] if args.after_update
-               else (['kr', 'us'] if args.market == 'all' else [args.market]))
+    markets = ['kr', 'us'] if args.market == 'all' else [args.market]
     for m in markets:
         scan_market(m, limit=args.limit)
 
