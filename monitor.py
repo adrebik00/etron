@@ -1,16 +1,16 @@
 """
 CCI 반등 + 200일선 하단 + 피보나치 되돌림 — 모니터링 + Vercel 배포
 ============================================================
-로컬 KR/US 일봉 CSV 장종료 갱신 후 자동 스캔 -> HTML 리포트 -> Git push -> Vercel 배포
+Yahoo Finance REST API 로 일봉 수신 -> 자동 스캔 -> HTML 리포트 -> Git push -> Vercel 배포
 
 [사용법]
-  python monitor.py                        # KR/US 로컬 CSV 원샷 스캔
+  python monitor.py                        # KR/US/Crypto 원샷 스캔
   python monitor.py --market kr            # 한국만
   python monitor.py --market us            # 미국만
+  python monitor.py --market crypto        # 코인만
   python monitor.py --daemon               # 24시간 스케줄러
   python monitor.py --no-git               # Git push 안 함
   python monitor.py --strict               # 백테스트 동일 조건(추가 필터 전부 켜기)
-  python monitor.py --no-git               # Git push 없이 결과 생성
 
 [산출물]
   public/index.html       <- Vercel 에서 서빙하는 메인 페이지
@@ -47,12 +47,10 @@ ST.USE_RSI_DIV_FILTER = False
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(BASE_DIR, 'public')
 STATE_DIR  = os.path.join(BASE_DIR, 'monitor_state')
-BACKTEST_DIR = Path(os.environ.get(
-    'CCI_BACKTEST_DIR', r'C:\Users\user\Documents\claude_coding\backtest'))
-DAILY_DIRS = {
-    'kr': BACKTEST_DIR / 'kr_stock' / 'daily',
-    'us': BACKTEST_DIR / 'us_stock' / 'daily',
-}
+
+FETCH_PERIOD = '10y'
+YF_BATCH     = 50
+
 VIEW_BARS    = 200
 MAX_CHARTS_SIGNAL = 30
 MAX_CHARTS_WATCH  = 10
@@ -64,36 +62,101 @@ EXCH_MAP = {
     'KOSPI': 'KRX', 'KOSDAQ': 'KRX', 'KRX': 'KRX',
 }
 
+CRYPTO_TICKERS = {
+    'BTC-USD': 'BINANCE:BTCUSDT', 'ETH-USD': 'BINANCE:ETHUSDT',
+    'XRP-USD': 'BINANCE:XRPUSDT', 'SOL-USD': 'BINANCE:SOLUSDT',
+    'BNB-USD': 'BINANCE:BNBUSDT', 'DOGE-USD': 'BINANCE:DOGEUSDT',
+    'ADA-USD': 'BINANCE:ADAUSDT', 'TRX-USD': 'BINANCE:TRXUSDT',
+    'AVAX-USD': 'BINANCE:AVAXUSDT', 'LINK-USD': 'BINANCE:LINKUSDT',
+}
+
 # 스케줄 (KST 기준)
-KR_SCAN_TIME     = (15, 40)
-US_SCAN_TIME     = (6, 10)
-US_SCAN_DAYS     = {1, 2, 3, 4, 5}
+KR_SCAN_TIME      = (15, 40)
+US_SCAN_TIME      = (6, 10)
+CRYPTO_SCAN_TIME  = (9, 0)
+US_SCAN_DAYS      = {1, 2, 3, 4, 5}
 
 ENABLE_GIT_PUSH = True
 
 
 # ============================================================
-# 로컬 CSV 종목 목록
+# Yahoo Finance 데이터 수신
 # ============================================================
-def local_instruments(market, limit=0):
-    """백테스트와 동일한 일봉 CSV만 사용한다. 네트워크 수신은 하지 않는다."""
-    folder = DAILY_DIRS[market]
-    if not folder.is_dir():
-        raise FileNotFoundError(f'일봉 폴더 없음: {folder}')
-    instruments = []
-    for path in sorted(folder.glob('*.csv')):
-        stem = path.stem
-        if market == 'kr':
-            name, sep, code = stem.rpartition('_')
-            if not sep or not code.isdigit() or len(code) != 6:
-                continue
-            instruments.append((code, {'name': name, 'market': 'KRX'}, path))
+def fetch_yahoo(tickers, period=FETCH_PERIOD, batch=YF_BATCH, pause=0.5):
+    import yfinance as yf
+    all_data = {}
+    for s in range(0, len(tickers), batch):
+        chunk = tickers[s:s + batch]
+        try:
+            data = yf.download(chunk, period=period, progress=False,
+                               group_by='ticker', auto_adjust=True,
+                               threads=True)
+        except Exception as e:
+            print(f'  [WARN] yf.download 실패: {e}')
+            continue
+        if data.empty:
+            continue
+        if len(chunk) == 1:
+            sym = chunk[0]
+            df = data.reset_index()
+            if 'Date' in df.columns and len(df) > 0:
+                all_data[sym] = df
         else:
-            instruments.append((stem, {'name': stem, 'market': 'NASDAQ'}, path))
-    if limit:
-        instruments = instruments[:limit]
-    print(f'  로컬 {market.upper()} 일봉 CSV {len(instruments)}개: {folder}')
-    return instruments
+            for sym in chunk:
+                try:
+                    sub = data[sym].dropna(how='all').reset_index()
+                except (KeyError, TypeError):
+                    continue
+                if 'Date' in sub.columns and len(sub) > 0:
+                    all_data[sym] = sub
+        received = len(all_data)
+        print(f'  {min(s + batch, len(tickers))}/{len(tickers)} '
+              f'수신 {received}개', flush=True)
+        if pause and s + batch < len(tickers):
+            time.sleep(pause)
+    return all_data
+
+
+# ============================================================
+# 종목 목록
+# ============================================================
+def get_kr_tickers(limit=1000):
+    import FinanceDataReader as fdr
+    listing = fdr.StockListing('KRX')
+    skip = listing['Name'].str.contains(
+        'ETN|스팩|우선주|리츠', na=False, regex=True)
+    listing = listing[~skip]
+    if 'Marcap' in listing.columns:
+        listing = listing.sort_values('Marcap', ascending=False)
+    tickers = listing['Code'].astype(str).str.zfill(6).head(limit).tolist()
+    names = dict(zip(tickers,
+                     listing['Name'].head(limit).tolist()))
+    yf_tickers = [t + '.KS' for t in tickers]
+    print(f'  한국 {len(yf_tickers)}종목 (시총 상위)')
+    return yf_tickers, names
+
+
+def get_us_tickers(limit=2000):
+    import FinanceDataReader as fdr
+    listing = fdr.StockListing('S&P500')
+    extra = fdr.StockListing('NASDAQ')
+    extra2 = fdr.StockListing('NYSE')
+    combined = pd.concat([listing, extra, extra2], ignore_index=True)
+    combined = combined.drop_duplicates(subset='Symbol')
+    if 'Marcap' in combined.columns:
+        combined = combined.sort_values('Marcap', ascending=False)
+    tickers = combined['Symbol'].head(limit).tolist()
+    names = dict(zip(tickers,
+                     combined['Name'].head(limit).tolist()))
+    print(f'  미국 {len(tickers)}종목 (시총 상위)')
+    return tickers, names
+
+
+def get_crypto_tickers():
+    tickers = list(CRYPTO_TICKERS.keys())
+    names = {t: t.replace('-USD', '') for t in tickers}
+    print(f'  코인 {len(tickers)}개')
+    return tickers, names
 
 
 # ============================================================
@@ -160,6 +223,8 @@ def evaluate(sym, info, df):
 # TradingView 심볼 변환
 # ============================================================
 def tv_symbol(sym, market):
+    if market == 'crypto':
+        return CRYPTO_TICKERS.get(sym, f'BINANCE:{sym.replace("-USD", "USDT")}')
     ex = EXCH_MAP.get(market, 'NASDAQ')
     clean = sym.split('.')[0]
     return f'{ex}:{clean}'
@@ -454,6 +519,7 @@ def build_html(results, watchlist_content):
         return (len(r['signals']), len(r['watch'])) if r else (0, 0)
     kr_s, kr_w = mc('kr')
     us_s, us_w = mc('us')
+    cr_s, cr_w = mc('crypto')
 
     wl_escaped = _esc(watchlist_content)
 
@@ -470,6 +536,7 @@ def build_html(results, watchlist_content):
         '<nav>',
         f'<a href="#kr">한국 ({kr_s}+{kr_w})</a>',
         f'<a href="#us">미국 ({us_s}+{us_w})</a>',
+        f'<a href="#crypto">코인 ({cr_s}+{cr_w})</a>',
         f'<a class="dl" href="#" id="dl-btn">'
         f'워치리스트 ({total_sig + total_watch})</a>',
         '<a href="archive.html">아카이브</a>',
@@ -492,6 +559,8 @@ def build_html(results, watchlist_content):
         'kr', '한국 — 시총 상위 1,000개', results.get('kr')))
     parts.append(market_section_html(
         'us', '미국 — 시총 상위 2,000개', results.get('us')))
+    parts.append(market_section_html(
+        'crypto', '암호화폐 — 시총 상위 10개', results.get('crypto')))
     parts.append(
         f'<div id="wl-data" style="display:none">{wl_escaped}</div>')
     parts.append(
@@ -525,7 +594,7 @@ def build_html(results, watchlist_content):
 # ============================================================
 def generate_watchlist(results):
     lines = []
-    for mkt in ('kr', 'us'):
+    for mkt in ('kr', 'us', 'crypto'):
         res = results.get(mkt)
         if res is None:
             continue
@@ -575,42 +644,57 @@ def _state_path(market):
     return os.path.join(STATE_DIR, f'{market}_result.json')
 
 
-def scan_market(market, limit=0):
+def scan_market(market, limit=0, pause=0.5):
     t0 = time.time()
     print(f"\n{'=' * 60}")
     print(f" {market.upper()} 스캔 시작 "
           f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'=' * 60}")
 
-    instruments = local_instruments(market, limit)
-    if not instruments:
-        print('  [ERROR] 스캔할 CSV가 없습니다.')
+    if market == 'kr':
+        yf_tickers, names = get_kr_tickers(limit or 1000)
+        mkt_label = 'KRX'
+    elif market == 'us':
+        yf_tickers, names = get_us_tickers(limit or 2000)
+        mkt_label = 'NASDAQ'
+    elif market == 'crypto':
+        yf_tickers, names = get_crypto_tickers()
+        mkt_label = 'crypto'
+    else:
         return None
 
-    print(f"로컬 CSV 스캔 {len(instruments)}종목 ...")
+    print(f'데이터 수신 ({FETCH_PERIOD}, {len(yf_tickers)}종목) ...')
+    data = fetch_yahoo(yf_tickers, period=FETCH_PERIOD, pause=pause)
+    if not data:
+        print('  [ERROR] 데이터 수신 실패')
+        return None
+
+    print(f'스캔 {len(data)}종목 ...')
     sig, watch = [], []
     asof = ''
-    loaded = 0
-    for n, (sym, info, path) in enumerate(instruments, 1):
+    for sym, raw_df in data.items():
         try:
-            df = ST.load_csv(path)
+            df = ST.normalize_ohlcv(raw_df)
             if df is None or len(df) < ST.MIN_BARS:
                 continue
-            loaded += 1
-            r = evaluate(sym, info, df)
+            df, _, _ = ST.clean_ohlcv(df)
+            if len(df) < ST.MIN_BARS:
+                continue
+            clean_sym = sym.replace('.KS', '')
+            name = names.get(sym, names.get(clean_sym, clean_sym))
+            info = {'name': name, 'market': mkt_label}
+            r = evaluate(clean_sym, info, df)
         except Exception:
             continue
         last = pd.Timestamp(df['Date'].values[-1]).strftime('%Y-%m-%d')
         asof = max(asof, last)
         if r is None:
             continue
-        div_id = f'{market}_{r["tier"]}_{sym}'
+        div_id = f'{market}_{r["tier"]}_{clean_sym}'
         r['_card'] = render_card(r, div_id)
         del r['df']
         del r['idx']
         (sig if r['tier'] == 'signal' else watch).append(r)
-        if n % 250 == 0:
-            print(f'  {n}/{len(instruments)} 처리 · 후보 {len(sig) + len(watch)}개', flush=True)
 
     sig.sort(key=lambda r: -r['fib_pos'])
     watch.sort(key=lambda r: r['cci'])
@@ -618,7 +702,7 @@ def scan_market(market, limit=0):
     result = {
         'market': market,
         'scan_time': datetime.now().strftime('%Y-%m-%d %H:%M'),
-        'scanned': loaded,
+        'scanned': len(data),
         'asof': asof,
         'signals': sig,
         'watch': watch,
@@ -635,7 +719,7 @@ def scan_market(market, limit=0):
 
 def load_all_results():
     results = {}
-    for market in ('kr', 'us'):
+    for market in ('kr', 'us', 'crypto'):
         path = _state_path(market)
         if os.path.exists(path):
             try:
@@ -726,21 +810,6 @@ def _mark_ran(m):
 
 
 def _is_weekend_sleep(now):
-    wd = now.weekday()
-    if wd == 6:
-        wake = now + timedelta(days=1)
-        wake = wake.replace(hour=KR_SCAN_TIME[0], minute=KR_SCAN_TIME[1],
-                            second=0, microsecond=0)
-        return True, wake
-    if wd == 5:
-        cutoff = now.replace(hour=US_SCAN_TIME[0], minute=US_SCAN_TIME[1],
-                             second=0, microsecond=0)
-        if now >= cutoff and _already_ran('us'):
-            wake = now + timedelta(days=2)
-            wake = wake.replace(hour=KR_SCAN_TIME[0],
-                                minute=KR_SCAN_TIME[1],
-                                second=0, microsecond=0)
-            return True, wake
     return False, now
 
 
@@ -756,7 +825,7 @@ def _secs_until(h, m, only_days=None):
 
 
 def scan_then_publish(market, git_message):
-    """이미 갱신된 로컬 CSV를 읽어 리포트와 Vercel 결과를 갱신한다."""
+    """Yahoo Finance API로 데이터 수신 → 스캔 → HTML → Git push."""
     if scan_market(market) is None:
         raise RuntimeError('스캔 결과가 없습니다.')
     rebuild_html()
@@ -772,16 +841,20 @@ def daemon_loop():
           f"{KR_SCAN_TIME[0]:02d}:{KR_SCAN_TIME[1]:02d} KST")
     print(f"  미국:  화~토      "
           f"{US_SCAN_TIME[0]:02d}:{US_SCAN_TIME[1]:02d} KST")
+    print(f"  코인:  매일       "
+          f"{CRYPTO_SCAN_TIME[0]:02d}:{CRYPTO_SCAN_TIME[1]:02d} KST")
     print(f"  Git push: {ENABLE_GIT_PUSH}")
     print(f"  Ctrl+C 로 종료\n")
 
-    print(f"  [시작] 현재 로컬 KR/US CSV로 초기 스캔 실행")
-    for m in ('kr', 'us'):
+    print(f"  [시작] 전체 시장 초기 스캔 실행 (Yahoo Finance API)")
+    for m in ('kr', 'us', 'crypto'):
         try:
-            scan_then_publish(m, f'[scan] 초기 {m.upper()} {datetime.now():%Y%m%d_%H%M}')
+            scan_market(m)
             _mark_ran(m)
         except Exception as e:
             print(f"[ERROR] {m.upper()} 초기 스캔: {e}")
+    rebuild_html()
+    git_push(f'[scan] 초기 {datetime.now():%Y%m%d_%H%M}')
 
     SLEEP = 30
 
@@ -809,9 +882,9 @@ def daemon_loop():
             except Exception as e:
                 print(f"[ERROR] KR scan: {e}")
 
-        elif ((h, m) == US_SCAN_TIME
-              and now.weekday() in US_SCAN_DAYS
-              and not _already_ran('us')):
+        if ((h, m) == US_SCAN_TIME
+                and now.weekday() in US_SCAN_DAYS
+                and not _already_ran('us')):
             _mark_ran('us')
             try:
                 scan_then_publish('us', f'[scan] US {now.strftime("%Y%m%d")}')
@@ -819,10 +892,20 @@ def daemon_loop():
             except Exception as e:
                 print(f"[ERROR] US scan: {e}")
 
+        if ((h, m) == CRYPTO_SCAN_TIME and not _already_ran('crypto')):
+            _mark_ran('crypto')
+            try:
+                scan_then_publish('crypto',
+                                  f'[scan] Crypto {now.strftime("%Y%m%d")}')
+                scanned = True
+            except Exception as e:
+                print(f"[ERROR] Crypto scan: {e}")
+
         if not scanned:
             ks = _secs_until(*KR_SCAN_TIME, only_days={0, 1, 2, 3, 4})
             us = _secs_until(*US_SCAN_TIME, only_days=US_SCAN_DAYS)
-            labels = [(ks, 'KR'), (us, 'US')]
+            cs = _secs_until(*CRYPTO_SCAN_TIME)
+            labels = [(ks, 'KR'), (us, 'US'), (cs, 'Crypto')]
             labels.sort(key=lambda x: x[0])
             nlbl = labels[0][1]
             ns = labels[0][0]
@@ -839,7 +922,8 @@ def daemon_loop():
 def main():
     ap = argparse.ArgumentParser(
         description='CCI 반등 모니터링 + Vercel 배포')
-    ap.add_argument('--market', choices=['kr', 'us', 'all'], default='all')
+    ap.add_argument('--market',
+                    choices=['kr', 'us', 'crypto', 'all'], default='all')
     ap.add_argument('--daemon', action='store_true',
                     help='24시간 스케줄러 모드')
     ap.add_argument('--limit', type=int, default=0)
@@ -868,7 +952,8 @@ def main():
         daemon_loop()
         return
 
-    markets = ['kr', 'us'] if args.market == 'all' else [args.market]
+    markets = (['kr', 'us', 'crypto'] if args.market == 'all'
+               else [args.market])
     for m in markets:
         scan_market(m, limit=args.limit)
 
